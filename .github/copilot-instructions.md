@@ -54,10 +54,18 @@
 
 #### Error Handling
 - Use try-except blocks with specific exception types
-- Log errors with context using `print(..., flush=True)` for immediate console output
+- Use Python's `logging` module for error logging and diagnostics
+- For quick debugging, `print(..., flush=True)` is acceptable but prefer logging
 - Return structured error responses in API endpoints:
   ```python
-  return jsonify({"error": "Description", "details": str(e)}), 500
+  import logging
+  logger = logging.getLogger(__name__)
+  
+  try:
+      # ... operation
+  except Exception as e:
+      logger.error(f"Operation failed: {e}", exc_info=True)
+      return jsonify({"error": "Description", "details": str(e)}), 500
   ```
 
 #### Documentation
@@ -300,7 +308,10 @@ When reviewing code:
 ```python
 from __future__ import annotations
 from typing import Dict, Any
+import logging
 from flask import Blueprint, request, jsonify
+
+logger = logging.getLogger(__name__)
 
 def create_feature_blueprint() -> Blueprint:
     """Create blueprint for new feature."""
@@ -321,7 +332,7 @@ def create_feature_blueprint() -> Blueprint:
             return jsonify({"status": "success", "result": result}), 200
             
         except Exception as e:
-            print(f"[Feature] Error: {e}", flush=True)
+            logger.error(f"[Feature] Error: {e}", exc_info=True)
             return jsonify({"error": str(e)}), 500
     
     return bp
