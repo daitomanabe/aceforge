@@ -13,8 +13,17 @@ import uuid
 from pathlib import Path
 from flask import Blueprint, jsonify, request, send_file
 
+def _uppercase_track_in_instruction(instruction):
+    """Uppercase TRACK_NAME in 'Generate the X track ...' to match ACE-Step (cli.py _default_instruction_for_task)."""
+    if not instruction or " track " not in instruction:
+        return instruction
+    m = re.search(r"(\bthe\s+)(\w+)(\s+track\b)", instruction, re.IGNORECASE)
+    if m:
+        return instruction[: m.start(2)] + m.group(2).upper() + instruction[m.end(2) :]
+    return instruction
+
 from cdmf_paths import get_output_dir, get_user_data_dir, get_models_folder, load_config
-from cdmf_tracks import list_lora_adapters, load_track_meta, save_track_meta
+from cdmf_tracks import get_audio_duration, list_lora_adapters, load_track_meta, save_track_meta
 from cdmf_generation_job import GenerationCancelled
 import cdmf_state
 from generate_ace import register_job_progress_callback, _resolve_lm_checkpoint_path
@@ -32,6 +41,18 @@ _generation_busy = False
 _current_job_id: str | None = None
 # Job ids for which cancel was requested (cooperative stop)
 _cancel_requested: set = set()
+
+
+def reset_generation_queue() -> None:
+    """Clear the in-memory job queue and worker state. Call on app startup so each restart starts with an empty queue."""
+    global _generation_busy, _current_job_id
+    with _jobs_lock:
+        _jobs.clear()
+        _job_order.clear()
+        _cancel_requested.clear()
+        _generation_busy = False
+        _current_job_id = None
+    logging.info("[API generate] Generation queue reset (empty on startup).")
 
 
 def _is_cancel_requested(job_id: str) -> bool:
@@ -98,48 +119,58 @@ register_job_progress_callback(_on_job_progress)
 def _run_generation(job_id: str) -> None:
     """Background: run generate_track_ace and update job."""
     global _generation_busy, _current_job_id
-    with _jobs_lock:
-        job = _jobs.get(job_id)
-        if not job or job.get("status") != "queued":
-            return
-        job["status"] = "running"
-        job["progressPercent"] = 0.0
-        job["progressSteps"] = None
-        job["progressEta"] = None
-        job["progressStage"] = ""
-        _current_job_id = job_id
-
-    cdmf_state.set_current_generation_job_id(job_id)
-    cancel_check = lambda: _is_cancel_requested(job_id)
     try:
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if not job or job.get("status") != "queued":
+                return
+            job["status"] = "running"
+            job["progressPercent"] = 0.0
+            job["progressSteps"] = None
+            job["progressEta"] = None
+            job["progressStage"] = ""
+            _current_job_id = job_id
+
+        cdmf_state.set_current_generation_job_id(job_id)
+        cancel_check = lambda: _is_cancel_requested(job_id)
         from generate_ace import generate_track_ace
 
         params = job.get("params") or {}
         if not isinstance(params, dict):
             params = {}
-        # Map ace-step-ui GenerationParams to our API (support full UI payload including duration=-1, seed=-1, bpm=0)
+        # Map to ACE-Step params: task_type, reference_audio, src_audio, audio_cover_strength (Tutorial/INFERENCE.md)
         custom_mode = bool(params.get("customMode", False))
-        task = (params.get("taskType") or "text2music").strip().lower()
+        task = (params.get("task_type") or params.get("taskType") or "text2music").strip().lower()
         allowed_tasks = ("text2music", "retake", "repaint", "extend", "cover", "audio2audio", "lego", "extract", "complete")
         if task not in allowed_tasks:
             task = "text2music"
         # Single style/caption field drives all text conditioning (ACE-Step caption).
-        # Simple mode: songDescription. Advanced mode: style. Both can have key, time sig, vocal language.
-        prompt = (params.get("style") or "").strip() if custom_mode else (params.get("songDescription") or "").strip()
+        # Simple mode: songDescription. Advanced mode: style. Lego/extract/complete: instruction + caption only (no metas; source sets context).
+        if task in ("lego", "extract", "complete"):
+            instruction = (params.get("instruction") or "").strip()
+            caption = (params.get("style") or "").strip()
+            if not instruction and not caption:
+                instruction = "Generate an instrument track based on the audio context:"
+            prompt = None  # built below after we have duration/bpm/metas
+        else:
+            instruction = None
+            caption = None
+            prompt = (params.get("style") or "").strip() if custom_mode else (params.get("songDescription") or "").strip()
         key_scale = (params.get("keyScale") or "").strip()
         time_sig = (params.get("timeSignature") or "").strip()
         vocal_lang = (params.get("vocalLanguage") or "").strip().lower()
         extra_bits = []
-        if key_scale:
-            extra_bits.append(f"key {key_scale}")
-        if time_sig:
-            extra_bits.append(f"time signature {time_sig}")
-        if vocal_lang and vocal_lang not in ("unknown", ""):
-            extra_bits.append(f"vocal language {vocal_lang}")
-        if extra_bits:
-            prompt = f"{prompt}, {', '.join(extra_bits)}" if prompt else ", ".join(extra_bits)
-        # When user explicitly chose English, reinforce in caption so model conditions on it
-        if vocal_lang == "en" and prompt:
+        if task != "lego":
+            if key_scale:
+                extra_bits.append(f"key {key_scale}")
+            if time_sig:
+                extra_bits.append(f"time signature {time_sig}")
+            if vocal_lang and vocal_lang not in ("unknown", ""):
+                extra_bits.append(f"vocal language {vocal_lang}")
+            if extra_bits:
+                prompt = f"{prompt}, {', '.join(extra_bits)}" if prompt else ", ".join(extra_bits)
+        # When user explicitly chose English, reinforce in caption so model conditions on it (skip for lego)
+        if task != "lego" and vocal_lang == "en" and prompt:
             if not prompt.lower().startswith("english"):
                 prompt = f"English vocals, {prompt}"
         if not prompt:
@@ -187,22 +218,69 @@ def _run_generation(job_id: str) -> None:
                     bpm = None
             except (TypeError, ValueError):
                 bpm = None
+        # Lego/extract/complete: instruction (uppercase track) + caption appended with comma.
+        # No metas — BPM/key/timesignature should match the input backing.
+        if task in ("lego", "extract", "complete"):
+            instruction = _uppercase_track_in_instruction(
+                instruction or "Generate an instrument track based on the audio context:"
+            )
+            prompt = (instruction.rstrip(":").strip() + ", " + (caption or "").strip()).strip() if (instruction or caption) else instruction
+            if not prompt:
+                prompt = instruction or "Generate an instrument track based on the audio context"
         title = (params.get("title") or "Untitled").strip() or "Track"
-        reference_audio_url = (params.get("referenceAudioUrl") or params.get("reference_audio_path") or "").strip()
-        source_audio_url = (params.get("sourceAudioUrl") or params.get("src_audio_path") or "").strip()
-        # For cover/retake use source-first (song to cover); for style/reference use reference-first
-        if task in ("cover", "retake"):
-            resolved = _resolve_audio_url_to_path(source_audio_url) if source_audio_url else None
-            src_audio_path = resolved or (_resolve_audio_url_to_path(reference_audio_url) if reference_audio_url else None)
+        # reference_audio / src_audio per ACE-Step (paths or our URLs from library)
+        reference_audio_url = (params.get("reference_audio") or params.get("referenceAudioUrl") or params.get("reference_audio_path") or "").strip()
+        source_audio_url = (params.get("src_audio") or params.get("sourceAudioUrl") or params.get("source_audio_path") or "").strip()
+        # Cover with two audios: source = structure/duration, reference = style (blend mode)
+        cover_blend = task == "cover" and source_audio_url and reference_audio_url
+        if cover_blend:
+            source_path = _resolve_audio_url_to_path(source_audio_url)
+            style_path = _resolve_audio_url_to_path(reference_audio_url)
+            if not source_path or not style_path:
+                raise ValueError("Cover blend requires both source and style audio to be resolvable (Library or Upload).")
+            src_audio_path = style_path  # ref for conditioning = style
+            cover_duration_path = source_path  # duration from source
         else:
-            resolved = _resolve_audio_url_to_path(reference_audio_url) if reference_audio_url else None
-            src_audio_path = resolved or (_resolve_audio_url_to_path(source_audio_url) if source_audio_url else None)
+            cover_duration_path = None
+            # For cover/retake/lego use source-first (backing/song to cover); for style/reference use reference-first
+            if task in ("cover", "retake", "lego"):
+                resolved = _resolve_audio_url_to_path(source_audio_url) if source_audio_url else None
+                src_audio_path = resolved or (_resolve_audio_url_to_path(reference_audio_url) if reference_audio_url else None)
+            else:
+                resolved = _resolve_audio_url_to_path(reference_audio_url) if reference_audio_url else None
+                src_audio_path = resolved or (_resolve_audio_url_to_path(source_audio_url) if source_audio_url else None)
 
-        # When reference/source audio is provided, enable Audio2Audio so ACE-Step uses it (cover/retake/repaint).
-        # See docs/ACE-Step-INFERENCE.md: audio_cover_strength 1.0 = strong adherence; 0.5–0.8 = more caption influence.
+        # Cover: when duration not set (<=0), use source file length
+        if task == "cover" and duration <= 0:
+            path_for_duration = cover_duration_path if cover_blend else src_audio_path
+            if path_for_duration:
+                file_sec = get_audio_duration(Path(path_for_duration))
+                if file_sec > 0:
+                    duration = file_sec
+        if duration <= 0:
+            duration = 60
+        duration = max(15, min(240, duration))
+
+        # When reference/source audio is provided, enable Audio2Audio so ACE-Step uses it (cover/retake/repaint/lego).
+        # Defaults aligned with ACE-Step-MCP (ref_audio_strength 0.5) and cover/retake UX (strong source → 0.8).
+        # Lego/extract/complete: low ref_audio_strength so output follows prompt (new instrument), not copy of backing.
+        # See docs/ACE-Step-INFERENCE.md: audio_cover_strength 1.0 = strong adherence; lower = more prompt influence.
         audio2audio_enable = bool(src_audio_path)
-        ref_default = 0.8 if task in ("cover", "retake", "audio2audio") else 0.7
-        ref_audio_strength = float(params.get("audioCoverStrength") or params.get("ref_audio_strength") or ref_default)
+        ref_default = 0.8 if task in ("cover", "retake") else (0.5 if task == "audio2audio" else 0.7)
+        if task in ("lego", "extract", "complete"):
+            ref_default = 0.25  # low strength so output follows prompt (instrument) while matching backing timing
+        # audio_cover_strength per ACE-Step; lego/cover blend use specific overrides when set
+        ref_audio_strength = params.get("legoBackingInfluence") if task in ("lego", "extract", "complete") else None
+        if ref_audio_strength is None and cover_blend:
+            ref_audio_strength = params.get("coverBlendFactor") if params.get("coverBlendFactor") is not None else 0.5
+        if ref_audio_strength is None:
+            ref_audio_strength = (
+                params.get("audio_cover_strength")
+                or params.get("audioCoverStrength")
+                or params.get("ref_audio_strength")
+                or ref_default
+            )
+        ref_audio_strength = float(ref_audio_strength)
         ref_audio_strength = max(0.0, min(1.0, ref_audio_strength))
 
         # Repaint segment (for task=repaint); -1 means end of audio (converted to duration in generate_track_ace).
@@ -216,6 +294,13 @@ def _run_generation(job_id: str) -> None:
             repaint_end = -1.0
         # -1 means "end of audio"; generate_track_ace converts to target duration
 
+        # Retake/repaint variance (ACE-Step-MCP default 0.2)
+        try:
+            retake_variance = float(params.get("retake_variance") or params.get("retakeVariance") or 0.2)
+        except (TypeError, ValueError):
+            retake_variance = 0.2
+        retake_variance = max(0.0, min(1.0, retake_variance))
+
         # LoRA adapter (optional): path or folder name under custom_lora
         lora_name_or_path = (params.get("loraNameOrPath") or params.get("lora_name_or_path") or "").strip()
         try:
@@ -228,6 +313,10 @@ def _run_generation(job_id: str) -> None:
         thinking = bool(params.get("thinking", False))
         use_cot_metas = bool(params.get("useCotMetas", True))
         use_cot_caption = bool(params.get("useCotCaption", True))
+        # Lego/extract/complete: instruction must stay verbatim ("Generate the X track based on the audio context:").
+        # LM refinement would rephrase and can drop the track-type instruction, so disable CoT caption for these tasks.
+        if task in ("lego", "extract", "complete"):
+            use_cot_caption = False
         use_cot_language = bool(params.get("useCotLanguage", True))
         try:
             lm_temperature = float(params.get("lmTemperature") or params.get("lm_temperature") or 0.85)
@@ -255,7 +344,11 @@ def _run_generation(job_id: str) -> None:
             lm_tag = (j.get("lm_model") or "1.7B") if j else "1.7B"
         logging.info("[API generate] Using dit=%s, lm=%s", dit_tag, lm_tag)
         if src_audio_path:
-            logging.info("[API generate] Using reference audio: %s (task=%s, audio2audio=%s)", src_audio_path, task, audio2audio_enable)
+            logging.info(
+                "[API generate] Using reference audio: %s (task=%s, audio2audio=%s%s)",
+                src_audio_path, task, audio2audio_enable,
+                ", cover_blend=True" if cover_blend else "",
+            )
         else:
             logging.info("[API generate] No reference audio; text2music only")
 
@@ -286,6 +379,7 @@ def _run_generation(job_id: str) -> None:
             ref_audio_strength=ref_audio_strength,
             repaint_start=repaint_start,
             repaint_end=repaint_end,
+            retake_variance=retake_variance,
             vocal_gain_db=0.0,
             instrumental_gain_db=0.0,
             lora_name_or_path=lora_name_or_path or None,
@@ -400,14 +494,55 @@ def create_job():
         data = raw if isinstance(raw, dict) else {}
         logging.info("[API generate] Request body keys: %s", list(data.keys()) if data else [])
 
-        if not data.get("customMode") and not data.get("songDescription"):
+        def _str(v):
+            return (v or "").strip() if isinstance(v, str) else ""
+
+        task_raw = data.get("task_type") or data.get("taskType")
+        task_for_validation = _str(task_raw).lower() if task_raw else "text2music"
+        base_only_tasks = ("lego", "extract", "complete")
+        audio_tasks = ("cover", "retake", "audio2audio", "repaint", "extend")
+
+        # Only require songDescription for true "simple" mode: no customMode, no task context, no source/ref/style/prompt
+        has_src = bool(_str(data.get("src_audio") or data.get("sourceAudioUrl") or data.get("source_audio_path")))
+        has_ref = bool(_str(data.get("reference_audio") or data.get("referenceAudioUrl") or data.get("reference_audio_path")))
+        has_style = bool(_str(data.get("style") or data.get("prompt")))
+        has_song_desc = bool(_str(data.get("songDescription")))
+        is_simple_mode = not data.get("customMode") and not has_song_desc
+        # Allow without song description: custom mode, or any audio task, or has source/ref + style, or has style/prompt alone
+        allow_without_song_desc = (
+            data.get("customMode")
+            or task_for_validation in audio_tasks
+            or (has_src and has_style)
+            or (has_ref and has_style)
+            or has_src
+            or has_ref
+            or has_style
+        )
+        if is_simple_mode and not allow_without_song_desc:
             return jsonify({"error": "Song description required for simple mode"}), 400
+
+        if task_for_validation in base_only_tasks:
+            src_audio = _str(data.get("src_audio") or data.get("sourceAudioUrl") or data.get("source_audio_path"))
+            instruction = _str(data.get("instruction"))
+            style = _str(data.get("style"))
+            if not src_audio:
+                return jsonify({"error": "Backing/source audio required for Lego (and extract/complete)"}), 400
+            if not instruction and not style:
+                return jsonify({"error": "Describe the track (caption) or instruction required for Lego"}), 400
+        elif task_for_validation in audio_tasks:
+            src_audio = _str(data.get("src_audio") or data.get("sourceAudioUrl") or data.get("source_audio_path"))
+            ref_audio = _str(data.get("reference_audio") or data.get("referenceAudioUrl") or data.get("reference_audio_path"))
+            if not src_audio and not ref_audio:
+                return jsonify({"error": "Source or reference audio required for Cover (and retake/audio2audio/repaint/extend)"}), 400
+            style = _str(data.get("style") or data.get("prompt"))
+            if task_for_validation == "cover" and not style:
+                return jsonify({"error": "Cover style description required (e.g. jazz piano cover with swing rhythm)"}), 400
         # Custom mode: require at least one of style, lyrics, reference audio, or source audio
         if data.get("customMode"):
             style = (data.get("style") or "").strip()
             lyrics = (data.get("lyrics") or "").strip()
-            ref_audio = (data.get("referenceAudioUrl") or data.get("reference_audio_path") or "").strip()
-            src_audio = (data.get("sourceAudioUrl") or data.get("source_audio_path") or "").strip()
+            ref_audio = (data.get("reference_audio") or data.get("referenceAudioUrl") or data.get("reference_audio_path") or "").strip()
+            src_audio = (data.get("src_audio") or data.get("sourceAudioUrl") or data.get("source_audio_path") or "").strip()
             if not style and not lyrics and not ref_audio and not src_audio:
                 return jsonify({"error": "Style, lyrics, or reference/source audio required for custom mode"}), 400
 
@@ -474,6 +609,27 @@ def get_status(job_id: str):
         "error": job.get("error"),
     }
     return jsonify(out)
+
+
+@bp.route("/unstick", methods=["POST"])
+def unstick_queue():
+    """POST /api/generate/unstick — clear stuck worker state and start the next queued job (if any)."""
+    global _generation_busy
+    started = None
+    with _jobs_lock:
+        _generation_busy = False
+        for jid in _job_order:
+            j = _jobs.get(jid)
+            if j and j.get("status") == "queued":
+                _generation_busy = True
+                threading.Thread(target=_run_generation, args=(jid,), daemon=True).start()
+                started = jid
+                break
+    return jsonify({
+        "ok": True,
+        "message": "Queue unstick: worker cleared." + (" Next queued job started." if started else " No queued jobs."),
+        "startedJobId": started,
+    })
 
 
 @bp.route("/cancel/<job_id>", methods=["POST"])

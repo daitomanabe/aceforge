@@ -125,15 +125,20 @@ ACE-Step text-to-music (and related tasks). Jobs are queued and run one at a tim
 - `inferenceSteps`: int (e.g. 55).
 - `guidanceScale`: float (e.g. 6.0).
 - `seed`: int; if `randomSeed` is true, server may override with random.
-- `taskType`: `"text2music"` | `"retake"` | `"repaint"` | `"extend"` | `"cover"` | `"audio2audio"`.
-- `referenceAudioUrl`, `sourceAudioUrl`: URLs like `/audio/refs/...` or `/audio/<filename>` for reference/cover.
-- `audioCoverStrength` / `ref_audio_strength`: 0–1.
-- `repaintingStart`, `repaintingEnd`: for repaint task.
+- **Task and audio params** (see [ACE-Step Tutorial](https://github.com/ace-step/ACE-Step-1.5/blob/main/docs/en/Tutorial.md#guiding-the-elephant-what-can-you-control)): The API accepts both **ACE-Step official names** (snake_case) and **UI names** (camelCase): `task_type` or `taskType`; `reference_audio` or `referenceAudioUrl` or `reference_audio_path`; `src_audio` or `sourceAudioUrl` or `source_audio_path`; `audio_cover_strength` or `audioCoverStrength` or `ref_audio_strength`.
+- `taskType` / `task_type`: `"text2music"` | `"retake"` | `"repaint"` | `"extend"` | `"cover"` | `"audio2audio"` | `"lego"` | `"extract"` | `"complete"`. **Lego**, **extract**, and **complete** require the ACE-Step **Base** DiT model (see Preferences and ACE-Step models).
+- `instruction`: optional; for **lego** (and extract/complete), task-specific instruction (e.g. `"Generate the guitar track based on the audio context:"`). If omitted for lego, the server builds one from track name/caption.
+- `reference_audio` / `referenceAudioUrl`: path or URL for reference audio (style/timbre). `src_audio` / `sourceAudioUrl`: path or URL for source/backing audio (cover, repaint, lego, etc.). For **lego**, **extract**, and **complete**, source audio is required.
+- `audio_cover_strength` / `audioCoverStrength`: 0–1 (reference/source influence strength). Defaults: **cover/retake** 0.8 (strong source); **audio2audio** 0.5 (matches [ACE-Step-MCP](https://huggingface.co/spaces/reach-vb/ACE-Step-MCP)); **lego** uses `legoBackingInfluence` (default 0.25).
+- `retake_variance` / `retakeVariance`: 0–1, default 0.2 (retake/repaint; aligned with ACE-Step-MCP).
+- `repaintingStart`, `repaintingEnd` / `repaint_start`, `repaint_end`: for repaint task; -1 end = end of audio.
 - `title`: base name for output file.
 - `outputDir` / `output_dir`: optional; else uses app default.
 - `keyScale`, `timeSignature`, `vocalLanguage`, `bpm`: optional.
 - `loraNameOrPath`: optional; folder name from LoRA list or path to adapter (see `GET /api/generate/lora_adapters`).
 - `loraWeight`: optional; 0–2, default 0.75.
+
+**Base-only tasks (lego, extract, complete):** Require `ace_step_dit_model: "base"` in preferences and the Base model to be installed (Settings or `GET /api/ace-step/models`). For **lego**: send `taskType: "lego"`, `sourceAudioUrl` (backing audio), `instruction` (e.g. `"Generate the <track> track based on the audio context:"`), and `style` as the track description (caption). Supported track names: `vocals`, `backing_vocals`, `drums`, `bass`, `guitar`, `keyboard`, `percussion`, `strings`, `synth`, `fx`, `brass`, `woodwinds`. See `docs/ACE-Step-INFERENCE.md` for extract/complete parameters.
 
 **Response (POST):** `{ "jobId": "<uuid>", "status": "queued", "queuePosition": 1 }`
 
@@ -203,11 +208,12 @@ List available DiT/LM models and trigger downloads. **The ACE-Step 1.5 downloade
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/ace-step/models` | List DiT and LM models with `installed` status, plus `discovered_models`: all model directories found under the checkpoints folder (including custom trained models). Response includes `dit_models`, `lm_models`, `discovered_models` (id, label, path, custom), `acestep_download_available`, `checkpoints_path`. |
-| POST | `/api/ace-step/models/download` | Start download. Body: `{ "model": "turbo" | "turbo-shift1" | "sft" | "base" | "0.6B" | "1.7B" | "4B" }`. Uses bundled downloader (or `acestep-download` on PATH if not bundled). Returns `{ "ok", "model", "path" }` or `{ "error", "hint" }`. |
-| GET | `/api/ace-step/models/status` | Download progress: `{ "running", "model", "progress", "error" }`. |
+| GET | `/api/ace-step/models` | List DiT and LM models with `installed` status, plus `discovered_models`: all model directories found under the checkpoints folder (including custom trained models). Response includes `dit_models`, `lm_models`, `discovered_models` (id, label, path, custom), `acestep_download_available`, `checkpoints_path`. Use this to verify the **Base** model is installed before starting a lego/extract/complete job. |
+| POST | `/api/ace-step/models/download` | Start download. Body: `{ "model": "turbo" \| "turbo-shift1" \| "turbo-shift3" \| "turbo-continuous" \| "sft" \| "base" \| "0.6B" \| "1.7B" \| "4B" }`. Uses bundled downloader (or `acestep-download` on PATH if not bundled). Returns `{ "ok", "model", "path" }` or `{ "error", "hint" }`. |
+| GET | `/api/ace-step/models/status` | Download progress: `{ "running", "model", "progress", "error", "current_file", "file_index", "total_files", "eta_seconds", "cancelled" }`. |
+| POST | `/api/ace-step/models/download/cancel` | Request cancellation of the current download. Returns `{ "cancelled", "message" }`. |
 
-**Task types:** Generation accepts `taskType`: `text2music`, `cover`, `audio2audio`, `repaint`, `extend`, and (ACE-Step 1.5 Base) `lego`, `extract`, `complete`. Lego/extract/complete require the Base model and full 1.5 integration (planned).
+**Task → model:** Generation accepts `taskType`: `text2music`, `cover`, `audio2audio`, `repaint`, `extend`, and (Base-only) `lego`, `extract`, `complete`. **Lego**, **extract**, and **complete** require the **Base** DiT model: set `ace_step_dit_model` to `"base"` in preferences and ensure the Base model is installed (download via Settings or `POST /api/ace-step/models/download` with `"model": "base"`). The UI checks `GET /api/ace-step/models` for `dit_models[].installed` before allowing these tasks.
 
 ---
 

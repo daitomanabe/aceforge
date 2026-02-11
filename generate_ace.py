@@ -567,9 +567,9 @@ def _prepare_reference_audio(
     src_audio_path: str | None,
 ) -> tuple[str, bool, Optional[str]]:
     """
-    Normalise the ACE-Step edit / audio2audio mode:
+    Normalise the ACE-Step edit / audio2audio mode (task_type, reference_audio, src_audio per Tutorial/INFERENCE):
 
-      - Task is clamped to one of: text2music / retake / repaint / extend.
+      - Task (task_type) is clamped to one of: text2music / retake / repaint / extend.
       - UI tasks "cover" and "audio2audio" are mapped to "retake" (ACE-Step
         then uses ref_audio_input and sets task to "audio2audio" internally).
       - If Audio2Audio is enabled while task is still 'text2music', we
@@ -592,15 +592,18 @@ def _prepare_reference_audio(
     if audio2audio_enable and task_norm == "text2music":
         task_norm = "retake"
 
-    # Any of the edit-style tasks imply some form of Audio2Audio.
+    # Any of the edit-style tasks imply some form of Audio2Audio or source-backed (lego/extract/complete).
     audio2audio_flag = bool(
         audio2audio_enable or task_norm in ("retake", "repaint", "extend")
     )
+    needs_src_path = audio2audio_flag or task_norm in ("lego", "extract", "complete")
 
-    # If we *think* we're in an edit / audio2audio mode but there's no
-    # reference audio path at all, don't crash — just fall back to
-    # plain text2music.
-    if audio2audio_flag and not src_audio_path:
+    # If we need source/reference audio but none was provided, fall back to text2music (or fail for lego/extract/complete).
+    if needs_src_path and not src_audio_path:
+        if task_norm in ("lego", "extract", "complete"):
+            raise ValueError(
+                f"Task '{task_norm}' requires backing/source audio. Please provide it in the Lego tab or Custom audio card."
+            )
         print(
             "[ACE] Audio2Audio / edit task requested but no reference audio "
             "was provided — falling back to plain text2music.",
@@ -612,6 +615,8 @@ def _prepare_reference_audio(
 
     if audio2audio_flag:
         ref_path = _ensure_reference_wav(src_audio_path)
+    elif task_norm in ("lego", "extract", "complete"):
+        ref_path = _ensure_reference_wav(src_audio_path)  # pipeline uses this as src_audio_path
     else:
         ref_path = None
 
@@ -825,11 +830,11 @@ def _run_ace_text2music(
     task: str = "text2music",
     repaint_start: float = 0.0,
     repaint_end: float = 0.0,
-    retake_variance: float = 0.5,
+    retake_variance: float = 0.2,  # MCP retake/repaint use 0.2
     src_audio_path: str | None = None,
-    # Audio2Audio + LoRA
+    # Audio2Audio + LoRA (ref_audio_strength 0.5 matches ACE-Step-MCP / pipeline default)
     audio2audio_enable: bool = False,
-    ref_audio_strength: float = 0.7,
+    ref_audio_strength: float = 0.5,
     lora_name_or_path: str | None = None,
     lora_weight: float = 0.75,
     cancel_check: Optional[Callable[[], bool]] = None,
@@ -972,10 +977,10 @@ def _run_ace_text2music(
 
         # Wire up reference vs source audio per ACE-Step pipeline:
         #
-        # - retake / cover / audio2audio: use ref_audio_input (pipeline sets task to
-        #   "audio2audio" and uses ref_latents). Do NOT pass src_audio_path.
-        # - repaint / extend: use src_audio_path (pipeline uses src_latents for the
-        #   segment to repaint or extend). Do NOT pass ref_audio_input for this path.
+        # - retake / cover / audio2audio / lego / extract / complete: use ref_audio_input so the pipeline
+        #   gets backing latents. For lego we use LOW ref_audio_strength (API default 0.3) so diffusion
+        #   starts from noisy backing and denoises toward the prompt (new instrument), matching timing.
+        # - repaint / extend: use src_audio_path (pipeline uses src_latents for repaint/extend segment).
         # - text2music: leave both unset (None).
         if not src_audio_path:
             call_kwargs["ref_audio_input"] = None
@@ -984,7 +989,7 @@ def _run_ace_text2music(
             call_kwargs["src_audio_path"] = src_audio_path
             call_kwargs["ref_audio_input"] = None
         else:
-            # retake (including cover/audio2audio from UI)
+            # retake, cover, audio2audio, lego, extract, complete: backing as ref (lego uses low ref_audio_strength)
             call_kwargs["ref_audio_input"] = src_audio_path
             call_kwargs["src_audio_path"] = None
 
@@ -1117,9 +1122,9 @@ def generate_track_ace(
     task: str = "text2music",
     repaint_start: float = 0.0,
     repaint_end: float = 0.0,
-    retake_variance: float = 0.5,
+    retake_variance: float = 0.2,  # ACE-Step-MCP retake/repaint default
     audio2audio_enable: bool = False,
-    ref_audio_strength: float = 0.7,
+    ref_audio_strength: float = 0.5,  # ACE-Step-MCP / pipeline default
     src_audio_path: str | None = None,
     lora_name_or_path: str | None = None,
     lora_weight: float = 0.75,
@@ -1219,7 +1224,7 @@ def generate_track_ace(
     if cfg_type not in ("apg", "cfg", "cfg_star"):
         cfg_type = "apg"
 
-    # Normalise edit / Audio2Audio settings before we talk to ACE-Step.
+    # Normalise edit / Audio2Audio (maps to ACE-Step task_type, ref_audio_input, src_audio, audio_cover_strength).
     task, audio2audio_enable, src_audio_path = _prepare_reference_audio(
         task,
         bool(audio2audio_enable),

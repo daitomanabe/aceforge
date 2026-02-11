@@ -1355,7 +1355,7 @@ class ACEStepPipeline:
         use_erg_lyric=False,
         use_erg_diffusion=False,
         retake_random_generators=None,
-        retake_variance=0.5,
+        retake_variance=0.2,
         add_retake_noise=False,
         guidance_scale_text=0.0,
         guidance_scale_lyric=0.0,
@@ -2052,7 +2052,7 @@ class ACEStepPipeline:
         lora_name_or_path: str = "none",
         lora_weight: float = 1.0,
         retake_seeds: list = None,
-        retake_variance: float = 0.5,
+        retake_variance: float = 0.2,  # ACE-Step-MCP retake/repaint default
         task: str = "text2music",
         repaint_start: int = 0,
         repaint_end: int = 0,
@@ -2195,9 +2195,14 @@ class ACEStepPipeline:
         preprocess_time_cost = end_time - start_time
         start_time = end_time
 
+        # Lego/extract/complete: generate NEW track from prompt only; use source only for duration (no repaint/retake).
+        # Repaint/retake/extend: use src_latents in diffusion.
         add_retake_noise = task in ("retake", "repaint", "extend")
         # retake equal to repaint
         if task == "retake":
+            repaint_start = 0
+            repaint_end = audio_duration
+        if task in ("lego", "extract", "complete"):
             repaint_start = 0
             repaint_end = audio_duration
 
@@ -2207,11 +2212,21 @@ class ACEStepPipeline:
                 "repaint",
                 "edit",
                 "extend",
-            ), "src_audio_path is required for retake/repaint/extend task"
+                "lego",
+                "extract",
+                "complete",
+            ), "src_audio_path is required for repaint/extend/lego/extract/complete task"
             assert os.path.exists(
                 src_audio_path
             ), f"src_audio_path {src_audio_path} does not exist"
-            src_latents = self.infer_latents(src_audio_path)
+            src_latents_inferred = self.infer_latents(src_audio_path)
+            if task in ("lego", "extract", "complete"):
+                # Use source only to set output duration; do not pass latents into diffusion (generate from scratch with prompt).
+                num_frames = src_latents_inferred.shape[-1]
+                audio_duration = num_frames * 512 * 8 / 44100.0
+                src_latents = None  # no repaint for lego
+            else:
+                src_latents = src_latents_inferred
         
         ref_latents = None
         if ref_audio_input is not None and audio2audio_enable:
